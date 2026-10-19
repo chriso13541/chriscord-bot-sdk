@@ -34,6 +34,8 @@ type fakeServer struct {
 	conns    []*websocket.Conn
 	sent     chan map[string]interface{} // what the bot sends on its connection
 	refuseWS bool
+	roster   []RosterEntry // the signed member list (nil: the server has none)
+	extra    []textMember  // members the server lists besides alice and the bot
 }
 
 func newFakeServer(t *testing.T, alice textIdentity) *fakeServer {
@@ -48,6 +50,7 @@ func newFakeServer(t *testing.T, alice textIdentity) *fakeServer {
 	mux.HandleFunc("GET /api/boards/{b}/keys", f.getKeys)
 	mux.HandleFunc("POST /api/boards/{b}/keys", f.postKeys)
 	mux.HandleFunc("GET /api/e2ee/pending", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"pending":[]}`)) })
+	mux.HandleFunc("GET /api/roster", f.getRoster)
 	mux.HandleFunc("/ws", f.ws)
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
@@ -116,7 +119,7 @@ func (f *fakeServer) putEncKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeServer) members(botKey string) []textMember {
-	ms := []textMember{f.alice}
+	ms := append([]textMember{f.alice}, f.extra...)
 	if f.encKey != nil {
 		m := *f.encKey
 		m.PublicKey = botKey
@@ -140,7 +143,7 @@ func (f *fakeServer) getKeys(w http.ResponseWriter, r *http.Request) {
 	board := r.PathValue("b")
 	for g, byRecipient := range f.boxes[board] {
 		if b, ok := byRecipient[testBotKey]; ok {
-			boxes = append(boxes, box{g, b, members[1]})
+			boxes = append(boxes, box{g, b, members[len(members)-1]})
 		}
 	}
 	out(w, map[string]interface{}{"latest": f.latest[board], "rotate": false, "boxes": boxes, "members": members})
@@ -353,4 +356,114 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for " + what)
+}
+
+func (f *fakeServer) getRoster(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.roster == nil {
+		w.WriteHeader(404)
+		out(w, map[string]string{"error": "not found"})
+		return
+	}
+	var after int64
+	json.Unmarshal([]byte(r.URL.Query().Get("after")), &after)
+	var es []RosterEntry
+	for i, e := range f.roster {
+		if int64(i+1) > after {
+			e.Seq = int64(i + 1)
+			es = append(es, e)
+		}
+	}
+	id := ""
+	if len(f.roster) > 0 {
+		op, _ := f.roster[0].op()
+		id = op.ID
+	}
+	out(w, map[string]interface{}{"id": id, "entries": es, "more": false})
+}
+
+// On a server with a signed member list, the bot gives keys only to the
+// people it allows — not to someone the server slips in — and makes a new
+// key once someone loses access.
+func TestBotFollowsSignedList(t *testing.T) {
+	maker, botKey := fixedKey(21), fixedKey(22)
+	cert, _ := NewBotCert(maker, botKey.Public().(ed25519.PublicKey), "Music", "Plays music", 1)
+	token, _ := EncodeBotToken(botKey, cert)
+	testBotKey = cert.BotKey
+	alice, eve, owner := testIdentity(23, "alice"), testIdentity(24, "eve"), testIdentity(25, "owner")
+	f := newFakeServer(t, alice)
+	enc := hex.EncodeToString(eve.encPub[:])
+	sig := hex.EncodeToString(ed25519.Sign(eve.idPriv, encKeyMessage(eve.encPub[:])))
+	f.extra = []textMember{{Username: "eve", PublicKey: eve.idHex, EncKey: &enc, Sig: &sig}}
+	// The owner's list: alice and the bot read #general; eve isn't on it.
+	start := newRosterOp("", owner.idHex, opStart)
+	start.Policy = &RosterPolicy{Approvers: "owner", Need: "1"}
+	start.Members = []RosterMember{{Key: alice.idHex, Kind: kindMember}, {Key: cert.BotKey, Kind: kindBot}}
+	start.Access = []RosterAccess{{Board: "general", All: true, Readers: []string{cert.BotKey}}}
+	e0, _ := makeRosterEntry(start, owner.idPriv)
+	f.roster = []RosterEntry{e0}
+
+	b, err := New(Options{Server: f.srv.URL, Token: token, Client: "testbot/1.0", Logf: t.Logf, RosterFile: t.TempDir() + "/roster.json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+	f.next(t, "presence")
+	if st := b.RosterState(); st != rosterActive {
+		t.Fatalf("state %q", st)
+	}
+	if err := b.Send("general", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	f.next(t, "message")
+	f.mu.Lock()
+	gen := f.latest["general"]
+	got := f.boxes["general"][gen]
+	f.mu.Unlock()
+	if got[alice.idHex] == "" || got[cert.BotKey] == "" || got[eve.idHex] != "" {
+		t.Fatalf("boxes went to %v", keysOf(got))
+	}
+
+	// The owner takes alice off #general: the bot's next message is under
+	// a new key alice doesn't get.
+	off := newRosterOp(start.ID, owner.idHex, opAccess)
+	off.Board, off.All = "general", new(bool)
+	e1, _ := makeRosterEntry(off, owner.idPriv)
+	f.mu.Lock()
+	f.roster = append(f.roster, e1)
+	f.mu.Unlock()
+	f.push(map[string]interface{}{"type": "roster_changed"})
+	time.Sleep(500 * time.Millisecond)
+	if err := b.Send("general", "after"); err != nil {
+		t.Fatal(err)
+	}
+	f.next(t, "message")
+	f.mu.Lock()
+	gen2 := f.latest["general"]
+	got = f.boxes["general"][gen2]
+	f.mu.Unlock()
+	if gen2 != gen+1 || got[alice.idHex] != "" || got[cert.BotKey] == "" {
+		t.Fatalf("generation %d → %d, boxes %v", gen, gen2, keysOf(got))
+	}
+
+	// The server drops the list: the bot remembers it, and gives nobody keys.
+	f.mu.Lock()
+	f.roster = []RosterEntry{}
+	f.mu.Unlock()
+	f.push(map[string]interface{}{"type": "roster_changed"})
+	time.Sleep(500 * time.Millisecond)
+	if st := b.RosterState(); st != rosterReplaced || b.roster.allows(alice.idHex, presenceKeyID) {
+		t.Fatalf("dropped list: state %q", st)
+	}
+}
+
+func keysOf(m map[string]string) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k[:8])
+	}
+	return out
 }

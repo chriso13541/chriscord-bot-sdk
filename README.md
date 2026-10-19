@@ -69,17 +69,64 @@ CHRISCORD_URL=https://chat.example.com CHRISCORD_BOT_TOKEN=ccbot_1_… go run ./
 | `OnVoiceState`, `VoiceStates`, `OthersIn`, `VoiceChannelOf` | who's in which voice channel it can see |
 | `JoinVoice`, `LeaveVoice`, `InVoice`, `WriteOpus`, `SetSpeaking` | being in a call and sending 20 ms Opus packets |
 | `OnCallReady`, `OnCallEnded` | its call is up; it was taken out of one |
+| `OnLaneOpen`, `OnLane`, `LaneSessions`, `LaneSession.Send`, `LaneSession.MayRead` | a plugin's end-to-end encrypted lanes to members' apps (below) |
 | `OnDenied`, `OnEvent`, `SendRaw`, `API` | the server's refusals, every event, and anything not covered |
 | `NewBotCert`, `EncodeBotToken`, `ParseBotToken`, `BotAddLink`, `NewBotRevocation` | the formats themselves (`botproto.go`) |
 
 chriscord-musicbot is a full example: commands, a queue, and music in calls.
+
+## Servers with a signed member list
+
+A server can have a signed member list: who may read each channel, signed
+by its owner and the approvers they chose. The server can't change it.
+Since 0.2.0 a bot follows it exactly like the app (`rostersync.go`):
+
+- channel keys, keys for newcomers and the bot's call key only go to people
+  the list allows, whatever the server says;
+- when someone loses access, the bot's next message uses a new key;
+- until the list has been fetched and checked, the bot gives keys to nobody.
+
+Set `Options.RosterFile` to a file the bot can keep. The bot then remembers
+the list between runs, so a server that drops it or starts a different one
+is noticed (`Bot.RosterState()` returns `"replaced"`, and no keys go to
+anyone). If the owner really did start over, delete the file.
+
+For the bot to read a channel there, the server's approvers have to add it
+to the list.
+
+## Plugin lanes
+
+A plugin whose `plugin.json` says `"lanes": true` gets its commands, panel
+clicks, answers and panels end-to-end encrypted (`lane.go`, `lanes.go`).
+Each member's app opens a lane to it: sealed for the plugin's published
+encryption key (on a server with a signed member list, only if the list has
+the plugin's key as a plugin), and signed by the member, so the server can't
+pretend to be someone else, read the lane, or replay anything on it.
+
+```go
+b.OnLaneOpen = func(s *chriscordbot.LaneSession) { s.Send(myPanel) }
+b.OnLane = func(s *chriscordbot.LaneSession, msg json.RawMessage) {
+	// {"t":"command","id","command","args","board"} or {"t":"action","id","action","value","board"}
+	s.Send(map[string]interface{}{"t": "reply", "to": id, "content": "Done"})
+}
+```
+
+The app understands `{"t":"reply","to","content","error"?}`,
+`{"t":"panel","board","panel"}` (null: none) and `{"t":"notice","board","text"}`.
+`s.Key` is the member's identity key and `s.Name` their name; check
+`s.MayRead(channel)` before sending a panel about a channel, or acting on
+one a command names. On a server with a signed member list only its members
+can open a lane. The server still sees who uses which plugin, when, and how
+much. A plugin the server runs is on the server's machine, so lanes keep
+what's said to it from the server software, its database and logs, not
+from whoever controls that machine.
 
 ## Keeping in step
 
 `botproto.go` is the same file (bar the package line) as the app's, and the
 server checks the same signatures; `botproto_test.go` pins them in both.
 `textcrypt.go`, `e2ee.go` and `e2ee_frame.go` follow the app's encryption
-and must change with it.
+and must change with it; `lane.go` is the same file as the app's.
 
 ## Testing
 

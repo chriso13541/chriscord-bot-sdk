@@ -43,7 +43,7 @@ import (
 )
 
 // Version of this package, sent along with the bot's own when it joins.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // Options for New.
 type Options struct {
@@ -59,6 +59,11 @@ type Options struct {
 	Logf func(format string, args ...interface{})
 	// HTTPClient for the server's API (default: 30 second timeout).
 	HTTPClient *http.Client
+	// RosterFile: where the bot remembers the server's signed member list
+	// (rostersync.go) between runs, so a server that drops it or starts a
+	// different one is noticed. Recommended; without it the bot trusts the
+	// first list it sees after each start.
+	RosterFile string
 }
 
 // Message is a chat message the bot can see, already decrypted.
@@ -101,6 +106,14 @@ type Bot struct {
 	OnDenied func(message string)
 	// OnEvent gets every event from the server, including the ones above.
 	OnEvent func(e Event)
+	// OnLaneOpen: a member's app opened an end-to-end encrypted lane to
+	// this bot (lanes.go) — a plugin's commands, clicks and panel.
+	OnLaneOpen func(s *LaneSession)
+	// OnLane: a message on one of those lanes, decrypted.
+	OnLane func(s *LaneSession, msg json.RawMessage)
+
+	lanesMu sync.Mutex
+	lanes   map[string]*LaneSession
 
 	server string
 	client string
@@ -111,6 +124,7 @@ type Bot struct {
 	text   *textCrypto
 	call   *callCrypto
 	status *botStatus
+	roster *rosterSync
 	limit  *channelLimiter
 	turns  *turns
 
@@ -154,6 +168,8 @@ func New(o Options) (*Bot, error) {
 	b.api = newAPI(server, o.HTTPClient)
 	b.text = newTextCrypto(b.api, key, logf)
 	b.call = newCallCrypto(key, b.sendJSON, logf)
+	b.roster = newRosterSync(b.api, o.RosterFile, logf)
+	b.text.roster, b.call.signed = b.roster, b.roster
 	b.status = newBotStatus(b)
 	b.limit = newChannelLimiter()
 	b.turns = newTurns()
@@ -326,6 +342,10 @@ func (b *Bot) session(ctx context.Context) error {
 		}
 	}()
 	b.announcePfp()
+	// The signed member list first: until it's checked, keys go to nobody.
+	if err := b.roster.refresh(); err != nil {
+		b.logf("chriscordbot: the signed member list: %v", err)
+	}
 	go b.text.begin()
 	go b.text.pendingLoop(stop)
 	go b.status.loop(stop)
@@ -417,6 +437,15 @@ func (b *Bot) handle(raw []byte) {
 		}
 	case "e2ee_changed":
 		b.text.changed()
+	case "plugin_lane":
+		b.onLane(raw)
+	case "roster_changed":
+		go func() {
+			if err := b.roster.refresh(); err != nil {
+				b.logf("chriscordbot: the signed member list: %v", err)
+			}
+			b.text.changed()
+		}()
 	case "voice_state":
 		b.onVoiceState(m.Channels)
 	case "voice_e2ee":

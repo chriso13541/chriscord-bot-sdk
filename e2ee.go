@@ -47,7 +47,8 @@ type e2eePeer struct {
 }
 
 type callCrypto struct {
-	priv ed25519.PrivateKey
+	priv   ed25519.PrivateKey
+	signed *rosterSync // the signed member list: who may be given the bot's call key
 
 	mu       sync.Mutex
 	board    string
@@ -167,6 +168,9 @@ func (c *callCrypto) helloLocked(reply bool) map[string]interface{} {
 }
 
 func (c *callCrypto) keyMsgLocked(user string, p *e2eePeer, k *sendKey) (outMsg, bool) {
+	if !c.signed.allows(p.identityHex, c.board) {
+		return outMsg{}, false // not let into this call by the signed member list
+	}
 	box, err := wrapKey(c.ephPriv, c.ephPub, p.eph, c.board, c.me, user, k.kid, k.raw)
 	if err != nil {
 		c.logf("e2ee: wrapping a key for %s: %v", user, err)

@@ -76,6 +76,7 @@ type textCrypto struct {
 	boardLock map[string]*sync.Mutex
 	published bool
 	pendingT  *time.Timer
+	roster    *rosterSync // the signed member list: who may be given keys
 }
 
 func newTextCrypto(a *api, priv ed25519.PrivateKey, logf func(string, ...interface{})) *textCrypto {
@@ -343,6 +344,9 @@ func (t *textCrypto) newGeneration(board string, bk *boardKeys) error {
 	boxes := []map[string]string{}
 	haveSelf := false
 	for _, m := range bk.members {
+		if !t.roster.allows(strings.ToLower(m.PublicKey), board) {
+			continue
+		}
 		enc, ok := memberEncKey(m)
 		if !ok {
 			continue
@@ -372,6 +376,7 @@ func (t *textCrypto) newGeneration(board string, bk *boardKeys) error {
 		cur.latest, cur.rotate = gen, false
 	}
 	t.mu.Unlock()
+	t.roster.madeNewKey(board)
 	t.logf("e2ee: new key (generation %d) for %s, for %d member(s)", gen, board, len(boxes))
 	return nil
 }
@@ -380,6 +385,9 @@ func (t *textCrypto) newGeneration(board string, bk *boardKeys) error {
 func (t *textCrypto) seal(board, text string) (string, error) {
 	t.ensurePublished()
 	id := t.identity()
+	if !t.roster.allows(id.idHex, board) {
+		return "", errors.New("the server's signed member list doesn't (yet) let this bot read that channel")
+	}
 	l := t.lockFor(board)
 	l.Lock()
 	defer l.Unlock()
@@ -388,7 +396,7 @@ func (t *textCrypto) seal(board, text string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if bk.latest == 0 || bk.rotate || t.key(board, bk.latest) == nil {
+		if bk.latest == 0 || bk.rotate || t.key(board, bk.latest) == nil || t.roster.needsNewKey(board) {
 			err := t.newGeneration(board, bk)
 			if isConflict(err) && attempt < 2 {
 				continue
@@ -466,6 +474,9 @@ func (t *textCrypto) runPending() {
 	fetched := map[string]bool{}
 	var boxes []map[string]interface{}
 	for _, p := range r.Pending {
+		if !t.roster.allows(strings.ToLower(p.Recipient.PublicKey), p.BoardID) {
+			continue
+		}
 		enc, ok := memberEncKey(p.Recipient)
 		if !ok {
 			continue
