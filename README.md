@@ -68,6 +68,8 @@ CHRISCORD_URL=https://chat.example.com CHRISCORD_BOT_TOKEN=ccbot_1_… go run ./
 | `Channels()` | the channels it was given |
 | `OnVoiceState`, `VoiceStates`, `OthersIn`, `VoiceChannelOf` | who's in which voice channel it can see |
 | `JoinVoice`, `LeaveVoice`, `InVoice`, `WriteOpus`, `SetSpeaking` | being in a call and sending 20 ms Opus packets |
+| `StartVideo`, `WriteVideoH264`, `StopVideo`, `OnVideoKeyframe` | showing a picture in the call (H.264), like a screen share |
+| `Announce` | telling a channel something, on lanes (not a chat message) |
 | `OnCallReady`, `OnCallEnded` | its call is up; it was taken out of one |
 | `OnLaneOpen`, `OnLane`, `LaneSessions`, `LaneSession.Send`, `LaneSession.MayRead` | a plugin's end-to-end encrypted lanes to members' apps (below) |
 | `OnDenied`, `OnEvent`, `SendRaw`, `API` | the server's refusals, every event, and anything not covered |
@@ -75,16 +77,19 @@ CHRISCORD_URL=https://chat.example.com CHRISCORD_BOT_TOKEN=ccbot_1_… go run ./
 
 chriscord-musicbot is a full example: commands, a queue, and music in calls.
 
-## Servers with a signed member list
+## The signed member list
 
-A server can have a signed member list: who may read each channel, signed
-by its owner and the approvers they chose. The server can't change it.
-Since 0.2.0 a bot follows it exactly like the app (`rostersync.go`):
+Every server needs a signed member list: who may read each channel, signed
+by its owner and the members who manage members. The server can't change
+it. Since 0.2.0 a bot follows it exactly like the app (`rostersync.go`):
 
 - channel keys, keys for newcomers and the bot's call key only go to people
   the list allows, whatever the server says;
+- the bot's call key only ever goes to members — never to other bots or
+  plugins, which can play into a call but never hear it;
 - when someone loses access, the bot's next message uses a new key;
-- until the list has been fetched and checked, the bot gives keys to nobody.
+- on a server without a list (or until it's been fetched and checked), the
+  bot gives keys to nobody, and can't send messages.
 
 Set `Options.RosterFile` to a file the bot can keep. The bot then remembers
 the list between runs, so a server that drops it or starts a different one
@@ -93,6 +98,17 @@ anyone). If the owner really did start over, delete the file.
 
 For the bot to read a channel there, the server's approvers have to add it
 to the list.
+
+## Who wrote a message
+
+A channel's key is shared by everyone who can read the channel, so it can't
+say who wrote a message. Every message the bot sends is signed with its
+identity key (`msgsig.go`, the same as the app's), and the bot checks the
+signature on every message it reads: one signed by a key that isn't its
+writer's is dropped. `Message.Signed` says whether it was signed at all —
+an unsigned one came from an older app, or from someone else who can read
+the channel writing as `Author`, so don't trust it for anything that
+matters.
 
 ## Plugin lanes
 
@@ -113,6 +129,14 @@ b.OnLane = func(s *chriscordbot.LaneSession, msg json.RawMessage) {
 
 The app understands `{"t":"reply","to","content","error"?}`,
 `{"t":"panel","board","panel"}` (null: none) and `{"t":"notice","board","text"}`.
+
+`b.Announce(channel, text)` tells everyone who may read a channel something
+("Now playing …"): it goes on each of their lanes, and their apps show it in
+the channel marked as the plugin's. It isn't a chat message — it's not in
+the channel's history, and the plugin needs no access to the channel. The
+last 20 per channel are kept for a day and shown to anyone who opens a lane
+later. Apps say when the server held back messages on a lane (the counters
+skip).
 `s.Key` is the member's identity key and `s.Name` their name; check
 `s.MayRead(channel)` before sending a panel about a channel, or acting on
 one a command names. On a server with a signed member list only its members
@@ -121,12 +145,28 @@ much. A plugin the server runs is on the server's machine, so lanes keep
 what's said to it from the server software, its database and logs, not
 from whoever controls that machine.
 
+## A picture in a call
+
+`video.go`: a bot in a call can show a picture too (a video it plays, say),
+which the app shows like a screen share. Like its sound, it's encrypted with
+the bot's own call keys; the bot still hears and sees nothing of the call.
+
+```go
+b.OnVideoKeyframe = func() { encoder.ForceKeyframe() } // someone started watching
+b.StartVideo(720, 30)                                  // height, fps
+b.WriteVideoH264(accessUnit, pts)                      // Annex B, Constrained Baseline
+b.StopVideo()
+```
+
+It needs the Video permission (`"video"` in a plugin's permissions).
+
 ## Keeping in step
 
 `botproto.go` is the same file (bar the package line) as the app's, and the
 server checks the same signatures; `botproto_test.go` pins them in both.
 `textcrypt.go`, `e2ee.go` and `e2ee_frame.go` follow the app's encryption
-and must change with it; `lane.go` is the same file as the app's.
+and must change with it; `lane.go` is the same file as the app's, and
+`msgsig.go` the same down to its own message contents.
 
 ## Testing
 

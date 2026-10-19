@@ -54,6 +54,17 @@ func newFakeServer(t *testing.T, alice textIdentity) *fakeServer {
 	mux.HandleFunc("/ws", f.ws)
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
+	// The signed member list (required): alice, and the bot reading #general.
+	owner := testIdentity(98, "owner")
+	start := newRosterOp("", owner.idHex, opStart)
+	start.Policy = &RosterPolicy{Approvers: "owner", Need: "1"}
+	start.Members = []RosterMember{{Key: alice.idHex, Kind: kindMember}, {Key: testBotKey, Kind: kindBot}}
+	start.Access = []RosterAccess{{Board: "general", All: true, Readers: []string{testBotKey}}}
+	e0, err := makeRosterEntry(start, owner.idPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.roster = []RosterEntry{e0}
 	return f
 }
 
@@ -466,4 +477,46 @@ func keysOf(m map[string]string) []string {
 		out = append(out, k[:8])
 	}
 	return out
+}
+
+// The list is required: on a server without one, the bot gives keys to
+// nobody (and so can't send); and bots and plugins never get call keys,
+// even where the list lets them read the channel.
+func TestNoListNoKeys(t *testing.T) {
+	maker, botKey := fixedKey(51), fixedKey(52)
+	cert, _ := NewBotCert(maker, botKey.Public().(ed25519.PublicKey), "Music", "Plays music", 1)
+	token, _ := EncodeBotToken(botKey, cert)
+	testBotKey = cert.BotKey
+	alice := testIdentity(53, "alice")
+	f := newFakeServer(t, alice)
+	f.roster = nil // a server from before member lists
+	b, err := New(Options{Server: f.srv.URL, Token: token, Client: "testbot/1.0", Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+	waitUntil(t, "the list checked", func() bool { return b.RosterState() == rosterNone })
+	if err := b.Send("general", "hi"); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("sent without a list: %v", err)
+	}
+	if b.roster.allows(alice.idHex, "general") || b.roster.allowsCall(alice.idHex, "general") {
+		t.Fatal("keys without a list")
+	}
+
+	owner, plug := testIdentity(54, "owner"), testIdentity(55, "plug")
+	start := newRosterOp("", owner.idHex, opStart)
+	start.Policy = &RosterPolicy{Approvers: "owner", Need: "1"}
+	start.Members = []RosterMember{{Key: alice.idHex, Kind: kindMember}, {Key: plug.idHex, Kind: kindPlugin}}
+	start.Access = []RosterAccess{{Board: "voice", All: true, Readers: []string{plug.idHex}}}
+	e0, _ := makeRosterEntry(start, owner.idPriv)
+	r, err := BuildRoster([]RosterEntry{e0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &rosterSync{state: rosterActive, r: r}
+	if !s.allows(plug.idHex, "voice") || s.allowsCall(plug.idHex, "voice") || !s.allowsCall(alice.idHex, "voice") {
+		t.Fatal("call keys: members only")
+	}
 }

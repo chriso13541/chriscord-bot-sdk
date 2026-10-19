@@ -13,9 +13,10 @@ package chriscordbot
 // a channel (a voice channel's panel, say).
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -50,35 +51,86 @@ func (s *LaneSession) Send(v interface{}) error {
 }
 
 // MayRead: whether this member may read board, as the server's signed
-// member list has it (with no list: as the server says, from the channel's
-// member list, looked at again after a minute).
-func (s *LaneSession) MayRead(board string) bool {
-	if s.b.roster.listed() {
-		return s.b.roster.allows(s.Key, board)
-	}
-	return s.b.text.serverSays(s.Key, board)
+// member list has it.
+func (s *LaneSession) MayRead(board string) bool { return s.b.roster.allows(s.Key, board) }
+
+// ── Announcements ────────────────────────────────────────────────────────────
+
+const (
+	announceKeep = 20             // per channel, for people who open a lane later
+	announceFor  = 24 * time.Hour // and for this long
+	announceMax  = 2000           // characters
+)
+
+type announcement struct {
+	ID    string `json:"id"`
+	Board string `json:"board"`
+	Text  string `json:"text"`
+	At    int64  `json:"at"` // unix milliseconds
 }
 
-// serverSays: whether the server lists key as a member of board.
-func (t *textCrypto) serverSays(key, board string) bool {
-	if board == "" {
-		return true
+func (a announcement) msg() map[string]interface{} {
+	return map[string]interface{}{"t": "notice", "public": true, "id": a.ID, "board": a.Board, "text": a.Text, "at": a.At}
+}
+
+// Announce tells everyone who may read channel something (a plugin's
+// "Now playing …"), on their lanes: their apps show it in that channel,
+// marked as this plugin's, but it isn't a chat message — it's not in the
+// channel's history, and the plugin needs no access to the channel at all.
+// The last few per channel are kept for a day and shown to anyone who
+// opens a lane later. On a server with a signed member list, "may read" is
+// as the list has it.
+func (b *Bot) Announce(channel, text string) error {
+	if channel == "" || text == "" {
+		return nil
 	}
-	t.mu.Lock()
-	bk := t.boards[board]
-	t.mu.Unlock()
-	if bk == nil || time.Since(bk.fetchedAt) > time.Minute {
-		var err error
-		if bk, err = t.fetch(board); err != nil {
-			return false
+	if r := []rune(text); len(r) > announceMax {
+		text = string(r[:announceMax])
+	}
+	var id [8]byte
+	rand.Read(id[:])
+	a := announcement{ID: hex.EncodeToString(id[:]), Board: channel, Text: text, At: time.Now().UnixMilli()}
+	b.lanesMu.Lock()
+	if b.announced == nil {
+		b.announced = map[string][]announcement{}
+	}
+	list := append(b.announced[channel], a)
+	if len(list) > announceKeep {
+		list = list[len(list)-announceKeep:]
+	}
+	b.announced[channel] = list
+	b.lanesMu.Unlock()
+	var firstErr error
+	for _, s := range b.LaneSessions() {
+		if !s.MayRead(channel) {
+			continue
+		}
+		if err := s.Send(a.msg()); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	for _, m := range bk.members {
-		if strings.EqualFold(m.PublicKey, key) {
-			return true
+	return firstErr
+}
+
+// replayAnnouncements: the recent ones s may see, to a lane just opened.
+func (b *Bot) replayAnnouncements(s *LaneSession) {
+	cutoff := time.Now().Add(-announceFor).UnixMilli()
+	b.lanesMu.Lock()
+	var all []announcement
+	for _, list := range b.announced {
+		for _, a := range list {
+			if a.At >= cutoff {
+				all = append(all, a)
+			}
 		}
 	}
-	return false
+	b.lanesMu.Unlock()
+	sort.Slice(all, func(i, j int) bool { return all[i].At < all[j].At })
+	for _, a := range all {
+		if s.MayRead(a.Board) {
+			s.Send(a.msg())
+		}
+	}
 }
 
 // LaneSessions: the lanes open now, oldest first.
@@ -181,36 +233,24 @@ func (b *Bot) laneHello(ev laneEvent) {
 	}
 	b.lanes[s.ID] = s
 	b.lanesMu.Unlock()
-	if f := b.OnLaneOpen; f != nil {
-		go f(s)
-	}
+	go func() {
+		b.replayAnnouncements(s)
+		if f := b.OnLaneOpen; f != nil {
+			f(s)
+		}
+	}()
 }
 
-// listed: whether the server has a signed member list (or might: while
-// it's being checked, or when it doesn't check out).
-func (s *rosterSync) listed() bool {
+// isMember: whether key is on the signed member list as a member.
+func (s *rosterSync) isMember(key string) bool {
 	if s == nil {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.state != rosterNone
-}
-
-// isMember: whether key is on the signed member list as a member (with no
-// list: anyone the server lets in).
-func (s *rosterSync) isMember(key string) bool {
-	if s == nil {
-		return true
+	if s.state != rosterActive {
+		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	switch s.state {
-	case rosterNone:
-		return true
-	case rosterActive:
-		m, ok := s.r.Members[key]
-		return ok && m.Kind == kindMember
-	}
-	return false
+	m, ok := s.r.Members[key]
+	return ok && m.Kind == kindMember
 }

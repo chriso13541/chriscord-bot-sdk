@@ -73,12 +73,15 @@ func laneHelloMessage(sid, plugin string, at int64) []byte {
 
 // laneKeys is one lane's keys and counters (one side's view).
 type laneKeys struct {
-	SID     string
-	toP     cipher.AEAD
-	fromP   cipher.AEAD
-	sentN   uint64 // the next counter this side sends with
-	gotN    uint64 // the highest counter received (+1); 0: none yet
-	gotAny  bool
+	SID    string
+	toP    cipher.AEAD
+	fromP  cipher.AEAD
+	sentN  uint64 // the next counter this side sends with
+	gotN   uint64 // the highest counter received (+1); 0: none yet
+	gotAny bool
+	// missed: counters skipped — messages the server held back (or lost).
+	// It can't change or replay them, but it can drop them; this shows it.
+	missed  uint64
 	created time.Time
 	used    time.Time
 }
@@ -148,6 +151,12 @@ func (k *laneKeys) open(dir byte, n uint64, data string) ([]byte, error) {
 	plain, err := aead.Open(nil, laneNonce(n), raw, laneAAD(k.SID, dir))
 	if err != nil {
 		return nil, errors.New("doesn't open (tampered with, or not for this lane)")
+	}
+	switch {
+	case k.gotAny && n > k.gotN:
+		k.missed += n - k.gotN
+	case !k.gotAny && n > 0:
+		k.missed += n
 	}
 	k.gotN, k.gotAny = n+1, true
 	k.used = time.Now()

@@ -166,13 +166,17 @@ func openBox(id textIdentity, senderID string, senderEnc [32]byte, board string,
 	return key, err
 }
 
-// textPlain is what's inside an encrypted message (the app's format; "a"
-// and "i" are kept as raw JSON since the bot doesn't use them).
+// textPlain is what's inside an encrypted message (the app's format; "a",
+// "i" and "l" are kept as raw JSON since the bot doesn't use them; "k" and
+// "s" are its writer's key and signature, msgsig.go).
 type textPlain struct {
 	U string          `json:"u"`
 	T string          `json:"t"`
 	A json.RawMessage `json:"a,omitempty"`
 	I json.RawMessage `json:"i,omitempty"`
+	L json.RawMessage `json:"l,omitempty"`
+	K string          `json:"k,omitempty"`
+	S string          `json:"s,omitempty"`
 }
 
 func textAAD(board string, gen int) []byte {
@@ -386,6 +390,9 @@ func (t *textCrypto) seal(board, text string) (string, error) {
 	t.ensurePublished()
 	id := t.identity()
 	if !t.roster.allows(id.idHex, board) {
+		if st := t.roster.State(); st != rosterActive {
+			return "", errors.New("no keys here: the server's signed member list is " + st + " (it's required: until it's set up and checks out, nobody gets keys)")
+		}
 		return "", errors.New("the server's signed member list doesn't (yet) let this bot read that channel")
 	}
 	l := t.lockFor(board)
@@ -409,7 +416,9 @@ func (t *textCrypto) seal(board, text string) (string, error) {
 		gen := t.boards[board].latest
 		key := t.boards[board].keys[gen]
 		t.mu.Unlock()
-		return sealPlain(key, board, gen, textPlain{U: id.me, T: text})
+		p := textPlain{U: id.me, T: text}
+		signPlain(&p, board, gen, id)
+		return sealPlain(key, board, gen, p)
 	}
 }
 
@@ -417,9 +426,16 @@ func (t *textCrypto) seal(board, text string) (string, error) {
 // (no key yet, broken, or forged); plain (unencrypted) messages come back
 // as they are.
 func (t *textCrypto) open(board, author, content string) (string, bool) {
+	text, _, ok := t.openSigned(board, author, content)
+	return text, ok
+}
+
+// openSigned is open, saying too whether its writer signed it (and the
+// signature checked out: one that doesn't isn't ok).
+func (t *textCrypto) openSigned(board, author, content string) (string, bool, bool) {
 	gen, blob, isEnc := parseText(content)
 	if !isEnc {
-		return content, true
+		return content, false, true
 	}
 	key := t.key(board, gen)
 	if key == nil {
@@ -438,13 +454,18 @@ func (t *textCrypto) open(board, author, content string) (string, bool) {
 		}
 	}
 	if key == nil {
-		return "", false
+		return "", false, false
 	}
 	p, err := openText(key, board, gen, blob)
 	if err != nil || len(p.I) > 0 || (author != "" && p.U != author) {
-		return "", false
+		return "", false, false
 	}
-	return p.T, true
+	signed, ok := t.checkWriter(board, gen, p)
+	if !ok {
+		t.logf("e2ee: a message in %s claiming to be from %s isn't signed by them — ignored", board, p.U)
+		return "", false, false
+	}
+	return p.T, signed, true
 }
 
 // changed: keys moved on the server — share what others need (debounced).

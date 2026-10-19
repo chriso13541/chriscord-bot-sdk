@@ -31,6 +31,7 @@ type voiceSession struct {
 	board string
 	pc    *webrtc.PeerConnection
 	track *webrtc.TrackLocalStaticSample
+	video *videoOut // its picture section (video.go)
 	// who the placeholders are for, in order (expected_others)
 	expected []string
 
@@ -83,6 +84,7 @@ func newVoiceSession(b *Bot, board string, others []string) (*voiceSession, erro
 	}
 	s := &voiceSession{b: b, board: board, pc: pc, track: track}
 	s.expected = others
+	s.addVideoSender()
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {

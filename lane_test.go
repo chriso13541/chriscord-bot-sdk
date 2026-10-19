@@ -128,6 +128,27 @@ func TestBotLanes(t *testing.T) {
 	if len(b.LaneSessions()) != 1 || b.LaneSessions()[0].Key != alice.idHex {
 		t.Fatal("one lane, alice's")
 	}
+	// An announcement: to alice (she may read #general), not to #secret.
+	b.Announce("secret", "not for alice")
+	b.Announce("general", "Now playing: something")
+	m = f.next(t, "plugin_lane")
+	if plain, err := k.open(laneFromPlugin, uint64(m["n"].(float64)), m["data"].(string)); err != nil ||
+		!strings.Contains(string(plain), `"public":true`) || !strings.Contains(string(plain), "Now playing") {
+		t.Fatalf("announcement: %s %v", plain, err)
+	}
+	// A lane opened later gets it too.
+	k2, eph2, hello2, _ := laneOpenFromApp(cert.BotKey, botEnc.encPub, alice.idPriv, "alice")
+	f.push(map[string]interface{}{"type": "plugin_lane", "from": "alice", "sid": k2.SID, "n": 0, "eph": eph2, "data": hello2})
+	for i := 0; i < 2; i++ { // the announcement and the welcome
+		m = f.next(t, "plugin_lane")
+		plain, err := k2.open(laneFromPlugin, uint64(m["n"].(float64)), m["data"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 && !strings.Contains(string(plain), "Now playing") {
+			t.Fatalf("replayed: %s", plain)
+		}
+	}
 
 	// With a signed member list that doesn't have eve: her lane is refused.
 	owner, eve := testIdentity(44, "owner"), testIdentity(45, "eve")
@@ -145,7 +166,7 @@ func TestBotLanes(t *testing.T) {
 	if m := f.next(t, "plugin_lane_gone"); m["to"] != "eve" {
 		t.Fatalf("eve: %v", m)
 	}
-	if len(b.LaneSessions()) != 1 {
+	if len(b.LaneSessions()) != 2 {
 		t.Fatal("eve's lane shouldn't be open")
 	}
 }

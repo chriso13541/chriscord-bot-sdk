@@ -195,16 +195,16 @@ func (s *rosterSync) applyLocked(es []RosterEntry, notice bool) {
 	}
 }
 
-// allows: whether key may be given board's keys.
+// allows: whether key may be given board's keys. Only ever by the signed
+// member list: on a server without one, nobody gets keys (the list is
+// required, as in the app).
 func (s *rosterSync) allows(key, board string) bool {
 	if s == nil {
-		return true
+		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch s.state {
-	case rosterNone:
-		return true
 	case rosterActive:
 		if board == presenceKeyID {
 			_, ok := s.r.Members[key]
@@ -213,6 +213,21 @@ func (s *rosterSync) allows(key, board string) bool {
 		return s.r.CanRead(key, board)
 	}
 	return false
+}
+
+// allowsCall: whether key may be given this bot's call keys in board — a
+// member (never a bot or plugin) the list lets into that channel.
+func (s *rosterSync) allowsCall(key, board string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != rosterActive {
+		return false
+	}
+	m, ok := s.r.Members[key]
+	return ok && m.Kind == kindMember && s.r.CanRead(key, board)
 }
 
 func (s *rosterSync) needsNewKey(board string) bool {
@@ -238,8 +253,14 @@ func (s *rosterSync) madeNewKey(board string) {
 // has none: keys go to whoever the server says), "active", or "replaced"
 // (it was dropped or started over since the bot last saw it: no keys to
 // anyone).
-func (b *Bot) RosterState() string {
-	b.roster.mu.Lock()
-	defer b.roster.mu.Unlock()
-	return b.roster.state
+func (b *Bot) RosterState() string { return b.roster.State() }
+
+// State: "loading", "none", "active" or "replaced".
+func (s *rosterSync) State() string {
+	if s == nil {
+		return rosterNone
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
 }

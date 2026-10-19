@@ -158,6 +158,12 @@ func (b *Bot) callUp(s *voiceSession) {
 	board := b.voiceBoard
 	b.mu.Unlock()
 	if current {
+		b.mu.Lock()
+		video := b.videoOn
+		b.mu.Unlock()
+		if video {
+			_ = b.announceVideo(board) // still showing its picture
+		}
 		if f := b.OnCallReady; f != nil {
 			f(board)
 		}
@@ -205,6 +211,7 @@ func (b *Bot) hangUp() (was string) {
 	s := b.voice
 	was = b.voiceBoard
 	b.voice, b.voiceBoard, b.rejoin = nil, "", false
+	b.videoOn = false // hanging up ends the picture too
 	b.mu.Unlock()
 	if s != nil {
 		s.close()

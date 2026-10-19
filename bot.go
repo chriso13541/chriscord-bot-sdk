@@ -43,7 +43,7 @@ import (
 )
 
 // Version of this package, sent along with the bot's own when it joins.
-const Version = "0.2.0"
+const Version = "0.2.1"
 
 // Options for New.
 type Options struct {
@@ -76,6 +76,10 @@ type Message struct {
 	// Seq counts messages in the order they arrived. Handlers run side by
 	// side, so a bot that must act on them strictly in order can use it.
 	Seq uint64
+	// Signed: its writer signed it (with the key the server lists them
+	// with). An unsigned one came from an older app — or from someone else
+	// who can read the channel, writing as Author.
+	Signed bool
 }
 
 // Event is anything the server sends, for what the package doesn't cover.
@@ -102,6 +106,9 @@ type Bot struct {
 	// (removed by a moderator, lost access, or everyone had gone while it
 	// was reconnecting).
 	OnCallEnded func(channel, reason string)
+	// OnVideoKeyframe: someone started watching the bot's picture (or lost
+	// it): the next frame should be a keyframe (video.go).
+	OnVideoKeyframe func()
 	// OnDenied: the server refused something the bot did, saying why.
 	OnDenied func(message string)
 	// OnEvent gets every event from the server, including the ones above.
@@ -112,8 +119,9 @@ type Bot struct {
 	// OnLane: a message on one of those lanes, decrypted.
 	OnLane func(s *LaneSession, msg json.RawMessage)
 
-	lanesMu sync.Mutex
-	lanes   map[string]*LaneSession
+	lanesMu   sync.Mutex
+	announced map[string][]announcement // by channel (lanes.go)
+	lanes     map[string]*LaneSession
 
 	server string
 	client string
@@ -136,11 +144,14 @@ type Bot struct {
 	seq        uint64
 	channels   map[string][]string // voice_state: board → who's in it
 	voiceBoard string              // the voice channel the bot is in ("" = none)
-	voice      *voiceSession
-	rejoin     bool      // after a reconnect: get back into voiceBoard
-	restartAt  time.Time // last call connection rebuild
-	pfp        []byte
-	pfpAt      int64
+	// its picture in the call (video.go)
+	videoOn          bool
+	videoH, videoFPS int
+	voice            *voiceSession
+	rejoin           bool      // after a reconnect: get back into voiceBoard
+	restartAt        time.Time // last call connection rebuild
+	pfp              []byte
+	pfpAt            int64
 }
 
 // New checks the token and makes the bot (it doesn't connect until Run).
@@ -505,11 +516,11 @@ func (b *Bot) deliver(cm chatMessage, seq uint64) {
 	if f == nil {
 		return
 	}
-	text, ok := b.text.open(cm.BoardID, cm.Username, cm.Content)
+	text, signed, ok := b.text.openSigned(cm.BoardID, cm.Username, cm.Content)
 	if !ok {
 		return
 	}
-	f(&Message{ID: cm.ID, Channel: cm.BoardID, Author: cm.Username, Text: text, ReplyTo: cm.ReplyTo, Seq: seq})
+	f(&Message{ID: cm.ID, Channel: cm.BoardID, Author: cm.Username, Text: text, ReplyTo: cm.ReplyTo, Seq: seq, Signed: signed})
 }
 
 // WaitTurn waits until the handlers for every message that arrived before

@@ -168,8 +168,8 @@ func (c *callCrypto) helloLocked(reply bool) map[string]interface{} {
 }
 
 func (c *callCrypto) keyMsgLocked(user string, p *e2eePeer, k *sendKey) (outMsg, bool) {
-	if !c.signed.allows(p.identityHex, c.board) {
-		return outMsg{}, false // not let into this call by the signed member list
+	if !c.signed.allowsCall(p.identityHex, c.board) {
+		return outMsg{}, false // a bot or plugin, or not let into this call by the signed member list
 	}
 	box, err := wrapKey(c.ephPriv, c.ephPub, p.eph, c.board, c.me, user, k.kid, k.raw)
 	if err != nil {
