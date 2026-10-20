@@ -76,11 +76,42 @@ func (b *Bot) onVoiceState(channels map[string][]string) {
 	}
 	b.call.updateRoster(channels)
 	b.mu.Lock()
-	b.channels = channels
 	board := b.voiceBoard
+	// Someone new in its call while it's speaking: the server only passes
+	// on changes, so they'd see no ring until the next one.
+	joined := false
+	if board != "" && b.speaking && !b.rejoin {
+		before := map[string]bool{}
+		for _, u := range b.channels[board] {
+			before[u] = true
+		}
+		for _, u := range channels[board] {
+			if u != b.me && !before[u] {
+				joined = true
+			}
+		}
+	}
+	b.channels = channels
 	rejoin := b.rejoin && board != ""
 	b.rejoin = false
 	b.mu.Unlock()
+	if joined {
+		go func() {
+			// After a moment, for their app to be in the call (it only
+			// listens for rings once it is), and again a little later in
+			// case its connection was slow.
+			for _, wait := range []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond} {
+				time.Sleep(wait)
+				b.mu.Lock()
+				on, still := b.speaking, b.voiceBoard == board
+				b.mu.Unlock()
+				if !on || !still {
+					return
+				}
+				_ = b.sendJSON(map[string]interface{}{"type": "speaking", "board_id": board, "speaking": true})
+			}
+		}()
+	}
 	if f := b.OnVoiceState; f != nil {
 		cp := make(map[string][]string, len(channels))
 		for k, v := range channels {
@@ -210,7 +241,7 @@ func (b *Bot) hangUp() (was string) {
 	b.mu.Lock()
 	s := b.voice
 	was = b.voiceBoard
-	b.voice, b.voiceBoard, b.rejoin = nil, "", false
+	b.voice, b.voiceBoard, b.rejoin, b.speaking = nil, "", false, false
 	b.videoOn = false // hanging up ends the picture too
 	b.mu.Unlock()
 	if s != nil {
@@ -243,7 +274,12 @@ func (b *Bot) moveTo(board string) {
 }
 
 // SetSpeaking shows (or stops showing) the speaking ring around the bot.
+// It stays on until turned off: the server only passes on changes, so
+// someone who joins the call meanwhile is told again (onVoiceState).
 func (b *Bot) SetSpeaking(on bool) {
+	b.mu.Lock()
+	b.speaking = on
+	b.mu.Unlock()
 	board, _ := b.InVoice()
 	if board != "" {
 		_ = b.sendJSON(map[string]interface{}{"type": "speaking", "board_id": board, "speaking": on})

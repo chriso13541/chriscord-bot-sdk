@@ -149,6 +149,7 @@ type Bot struct {
 	videoH, videoFPS int
 	voice            *voiceSession
 	rejoin           bool      // after a reconnect: get back into voiceBoard
+	speaking         bool      // SetSpeaking(true) last: said again to anyone joining the call
 	restartAt        time.Time // last call connection rebuild
 	pfp              []byte
 	pfpAt            int64
