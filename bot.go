@@ -456,6 +456,7 @@ func (b *Bot) handle(raw []byte) {
 				b.logf("chriscordbot: the signed member list: %v", err)
 			}
 			b.text.changed()
+			b.call.rosterChanged() // who may hear the bot may have changed: a new call key
 		}()
 	case "voice_state":
 		b.onVoiceState(m.Channels)

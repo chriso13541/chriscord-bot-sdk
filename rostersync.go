@@ -24,7 +24,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"time"
 )
 
 const (
@@ -37,6 +39,12 @@ const (
 type rosterPinFile struct {
 	ID      string `json:"id"`
 	Applied int    `json:"applied"`
+	// Head: the list's head after those entries (first 16 characters), so
+	// a list that was rolled back or altered isn't taken as the same one.
+	Head string `json:"head,omitempty"`
+	// Rotate: channels that need a new key because someone lost access
+	// (kept, so a restart before the bot's next message doesn't forget).
+	Rotate map[string]bool `json:"rotate,omitempty"`
 }
 
 type rosterSync struct {
@@ -52,30 +60,98 @@ type rosterSync struct {
 	pin     *rosterPinFile
 	rotate  map[string]bool
 	loading bool
+	again   bool // a change arrived while loading: fetch once more after
 }
 
 func newRosterSync(a *api, pinPath string, logf func(string, ...interface{})) *rosterSync {
 	s := &rosterSync{api: a, logf: logf, pinPath: pinPath, state: rosterLoading, rotate: map[string]bool{}}
 	if pinPath != "" {
-		if data, err := os.ReadFile(pinPath); err == nil {
+		data, err := os.ReadFile(pinPath)
+		switch {
+		case err == nil:
 			var p rosterPinFile
-			if json.Unmarshal(data, &p) == nil && p.ID != "" {
+			if err := json.Unmarshal(data, &p); err != nil {
+				// Damaged (written by an older version that could be cut
+				// off part-way): moved aside, not silently taken as "never
+				// seen a list" and then written over.
+				to := fmt.Sprintf("%s.corrupt-%s", pinPath, time.Now().Format("20060102-150405"))
+				os.Rename(pinPath, to)
+				logf("chriscordbot: WARNING: %s is damaged (%v) — moved to %s; the member list will be checked from scratch", pinPath, err, to)
+			} else if p.ID != "" {
 				s.pin = &p
+				for b := range p.Rotate {
+					s.rotate[b] = true
+				}
 			}
+		case !os.IsNotExist(err):
+			logf("chriscordbot: reading %s: %v", pinPath, err)
 		}
 	}
 	return s
 }
 
+// savePin replaces the pin file in one go: written next to it, flushed,
+// then renamed over it — a crash or SIGTERM part-way leaves the old one.
 func (s *rosterSync) savePin() {
 	if s.pinPath == "" || s.pin == nil {
 		return
 	}
-	data, _ := json.MarshalIndent(s.pin, "", "  ")
-	os.MkdirAll(filepath.Dir(s.pinPath), 0700)
-	if err := os.WriteFile(s.pinPath, data, 0600); err != nil {
-		s.logf("chriscordbot: remembering the member list: %v", err)
+	s.pin.Rotate = nil
+	if len(s.rotate) > 0 {
+		s.pin.Rotate = map[string]bool{}
+		for b := range s.rotate {
+			s.pin.Rotate[b] = true
+		}
 	}
+	data, err := json.MarshalIndent(s.pin, "", "  ")
+	if err == nil {
+		err = writeFileAtomic(s.pinPath, data, 0600)
+	}
+	if err != nil {
+		s.logf("chriscordbot: WARNING: remembering the member list (%s): %v", s.pinPath, err)
+	}
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(perm); err != nil && runtime.GOOS != "windows" {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	ok = true
+	if runtime.GOOS != "windows" {
+		if d, err := os.Open(dir); err == nil {
+			d.Sync()
+			d.Close()
+		}
+	}
+	return nil
 }
 
 type rosterResp struct {
@@ -88,13 +164,30 @@ type rosterResp struct {
 func (s *rosterSync) refresh() error {
 	s.mu.Lock()
 	if s.loading {
+		// Already fetching — but that fetch may have started before this
+		// change was stored, so the one running fetches again when done
+		// (like the app's rosterClient). Dropping it left the bot on an
+		// old list until the next change: a newly approved member got no
+		// keys, and a removal wasn't noticed.
+		s.again = true
 		s.mu.Unlock()
 		return nil
 	}
 	s.loading = true
 	after, known := s.lastSeq, s.r
 	s.mu.Unlock()
-	defer func() { s.mu.Lock(); s.loading = false; s.mu.Unlock() }()
+	defer func() {
+		s.mu.Lock()
+		s.loading = false
+		again := s.again
+		s.again = false
+		s.mu.Unlock()
+		if again {
+			if err := s.refresh(); err != nil {
+				s.logf("chriscordbot: the signed member list: %v", err)
+			}
+		}
+	}()
 
 	var fresh []RosterEntry
 	restart := false
@@ -148,6 +241,24 @@ func (s *rosterSync) refresh() error {
 			s.state = rosterReplaced
 			return fmt.Errorf("the member list doesn't check out: %w", err)
 		}
+		if s.pin != nil && s.pin.ID == r.ID && s.pin.Applied > 0 {
+			// The same list has to hold what the bot already worked
+			// through, the same way: fewer entries means the server lost
+			// or is hiding some (a removal, say); another head, altered.
+			why := ""
+			switch {
+			case s.pin.Applied > len(s.entries):
+				why = fmt.Sprintf("is missing changes the bot had already seen (%d of %d)", len(s.entries), s.pin.Applied)
+			case s.pin.Head != "" && headPrefix(r.Head) != s.pin.Head:
+				why = "was altered since the bot last saw it"
+			}
+			if why != "" {
+				s.entries, s.lastSeq, s.r = nil, 0, nil
+				s.state = rosterReplaced
+				s.logf("chriscordbot: WARNING: this server's signed member list %s — giving keys to nobody (delete %s if that's expected)", why, s.pinPath)
+				return nil
+			}
+		}
 		s.r = r
 		s.applyLocked(s.entries[k:], s.pin != nil && s.pin.ID == r.ID)
 	} else {
@@ -165,6 +276,7 @@ func (s *rosterSync) refresh() error {
 		s.state = rosterActive
 	}
 	s.pin.Applied = s.r.Applied + len(s.r.Rejected)
+	s.pin.Head = headPrefix(s.r.Head)
 	s.savePin()
 	return nil
 }
@@ -207,8 +319,11 @@ func (s *rosterSync) allows(key, board string) bool {
 	switch s.state {
 	case rosterActive:
 		if board == presenceKeyID {
-			_, ok := s.r.Members[key]
-			return ok
+			// Members and bots, never plugins (as in the app): a plugin
+			// runs on the server's machine, so giving it the presence key
+			// would hand everyone's status to whoever runs the server.
+			m, ok := s.r.Members[key]
+			return ok && m.Kind != kindPlugin
 		}
 		return s.r.CanRead(key, board)
 	}
@@ -244,7 +359,10 @@ func (s *rosterSync) madeNewKey(board string) {
 		return
 	}
 	s.mu.Lock()
-	delete(s.rotate, board)
+	if s.rotate[board] {
+		delete(s.rotate, board)
+		s.savePin()
+	}
 	s.mu.Unlock()
 }
 
@@ -263,4 +381,12 @@ func (s *rosterSync) State() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.state
+}
+
+// headPrefix: a list head as the pin keeps it (its first 16 characters).
+func headPrefix(h string) string {
+	if len(h) > 16 {
+		return h[:16]
+	}
+	return h
 }

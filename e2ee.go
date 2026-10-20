@@ -263,7 +263,15 @@ func (c *callCrypto) onHelloLocked(m *e2eeMsg) []outMsg {
 		out = append(out, outMsg{to: m.From, data: c.helloLocked(true)})
 	}
 	if _, inCall := c.roster[m.From]; inCall {
-		if isNew {
+		if isNew && c.curUnusedLocked() {
+			// Nothing has been sent with the current key yet (just joined
+			// the call), so there's nothing before them for it to open:
+			// hand it over now instead of making a new one. Otherwise the
+			// first second of sound went out on a key nobody had.
+			if km, ok := c.keyMsgLocked(m.From, p, c.cur); ok {
+				out = append(out, km)
+			}
+		} else if isNew {
 			c.scheduleRotateLocked()
 		} else {
 			for _, k := range []*sendKey{c.cur, c.next} {
@@ -277,6 +285,25 @@ func (c *callCrypto) onHelloLocked(m *e2eeMsg) []outMsg {
 		}
 	}
 	return out
+}
+
+// curUnusedLocked: the current key hasn't sealed a frame, no new one is
+// on its way, and no rotation is waiting (someone leaving) — so giving it
+// to someone arriving reveals nothing sent before them.
+func (c *callCrypto) curUnusedLocked() bool {
+	return c.cur != nil && c.cur.counter == 0 && c.next == nil && c.rotate == nil
+}
+
+// rosterChanged: the signed member list changed. Someone may have lost
+// access to the call's channel (they must not hear what's sent next) or
+// gained it (they need the key): either way, a new key for whoever the
+// list allows now.
+func (c *callCrypto) rosterChanged() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.board != "" {
+		c.scheduleRotateLocked()
+	}
 }
 
 func (c *callCrypto) onKeyLocked(m *e2eeMsg) {
@@ -357,8 +384,14 @@ func (c *callCrypto) resyncLoop() {
 	}
 	var out []outMsg
 	for u, since := range c.roster {
-		p := c.peers[u]
-		if (p == nil || len(p.keys) == 0) && time.Since(since) >= resyncEvery {
+		// Only people whose hello hasn't arrived. Unlike the app, the bot
+		// can't go by whether their keys have: members never give a bot
+		// or plugin their call key (it plays into a call, never hears it),
+		// so that was true of everyone, and the bot re-sent hellos — and
+		// its keys, on each answer — to the whole call every 2 seconds for
+		// as long as it was there. A member missing the bot's key asks
+		// for it themselves (their app's resync sends a hello).
+		if c.peers[u] == nil && time.Since(since) >= resyncEvery {
 			out = append(out, outMsg{to: u, data: c.helloLocked(false)})
 		}
 	}
@@ -411,7 +444,7 @@ func (c *callCrypto) ready() (withKey, total int) {
 	defer c.mu.Unlock()
 	for u := range c.roster {
 		total++
-		if c.peers[u] != nil {
+		if p := c.peers[u]; p != nil && c.signed.allowsCall(p.identityHex, c.board) {
 			withKey++
 		}
 	}
